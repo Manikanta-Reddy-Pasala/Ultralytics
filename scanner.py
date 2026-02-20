@@ -228,7 +228,13 @@ def run_inference(compiled_model, output_layer, img, conf_threshold, target_h, t
 
 
 ################################AI MODEL IMPORT#################################################
-model_2g_compiled, model_2g_output, model_2g_shape = load_openvino_model("2G_MODEL/best_int8_openvino_model/")
+# Use FP32 model for accuracy (INT8 loses some weak 2G detections due to quantization)
+if os.path.isdir("2G_MODEL/best_openvino_model"):
+    model_2g_compiled, model_2g_output, model_2g_shape = load_openvino_model("2G_MODEL/best_openvino_model/")
+elif os.path.isdir("2G_MODEL/best_int8_openvino_model"):
+    model_2g_compiled, model_2g_output, model_2g_shape = load_openvino_model("2G_MODEL/best_int8_openvino_model/")
+else:
+    raise FileNotFoundError("No 2G model found in 2G_MODEL/")
 model_3g_4g_compiled, model_3g_4g_output, model_3g_4g_shape = load_openvino_model("3G_4G_MODEL/best_openvino_model/")
 
 # Extract target sizes from model input shapes: [1, 3, H, W]

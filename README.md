@@ -26,28 +26,23 @@ python export_openvino.py
 
 This converts `.pt` files in `2G_MODEL/` and `3G_4G_MODEL/` to OpenVINO FP32 format with `dynamic=True` for flexible input sizes.
 
-For the 2G model, INT8 quantization is recommended for faster inference and lower memory:
+For the 2G model, INT8 quantization is possible but requires **spectrogram calibration data** (not generic COCO images). Without proper calibration, INT8 loses weak 2G detections. FP32 is recommended unless you have spectrogram-specific calibration data:
 ```bash
-# Export with INT8 (requires calibration data)
-yolo export model=2G_MODEL/best.pt format=openvino int8=True imgsz=1216
-mv 2G_MODEL/best_int8_openvino_model/ 2G_MODEL/best_int8_openvino_model/
+# INT8 (only with proper spectrogram calibration data)
+yolo export model=2G_MODEL/best.pt format=openvino int8=True dynamic=True data=your_spectrogram_data.yaml
 ```
 
 ### 2. Place models
 
 ```
 2G_MODEL/
-    best_int8_openvino_model/    # INT8 quantized (preferred, faster)
-        best.xml
-        best.bin
-        metadata.yaml
-    best_openvino_model/         # FP32 fallback
+    best_openvino_model/         # FP32 dynamic (recommended for accuracy)
         best.xml
         best.bin
         metadata.yaml
 
 3G_4G_MODEL/
-    best_openvino_model/         # FP32 (dynamic shape)
+    best_openvino_model/         # FP32 dynamic
         best.xml
         best.bin
         metadata.yaml
@@ -81,7 +76,7 @@ No PyTorch, no Ultralytics, no CUDA required at runtime.
 
 | Model | Architecture | Input Shape | Classes | Quantization |
 |-------|-------------|-------------|---------|--------------|
-| 2G | YOLO11n | Dynamic (stride 32) | 2G (GSM) | INT8 (recommended) or FP32 |
+| 2G | YOLO11n | Dynamic (stride 32) | 2G (GSM) | FP32 (recommended) or INT8 with spectrogram calibration |
 | 3G/4G | YOLOv12n | Dynamic (stride 32) | 3G (UMTS), 4G (LTE), 4G-TDD | FP32 |
 
 Both models are exported with `dynamic=True`, which traces symbolic dimensions through the ONNX graph (including attention layers in YOLOv12n). This allows stride-aligned minimal padding (`auto=True`) at runtime, preserving full detection accuracy across all band widths without the resolution loss of static 640x640 letterboxing.
