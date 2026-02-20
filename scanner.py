@@ -242,7 +242,7 @@ def run_inference(compiled_model, output_layer, img, conf_threshold, target_h, t
 
 
 ################################AI MODEL IMPORT#################################################
-model_2g_compiled, model_2g_output, model_2g_shape = load_openvino_model("2G_MODEL/best_int8_openvino_model/")
+model_2g_compiled, model_2g_output, model_2g_shape = load_openvino_model("2G_MODEL/best_openvino_model/")
 model_3g_4g_compiled, model_3g_4g_output, model_3g_4g_shape = load_openvino_model("3G_4G_MODEL/best_openvino_model/")
 
 # Extract target sizes from model input shapes: [1, 3, H, W]
