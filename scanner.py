@@ -67,15 +67,17 @@ _ov_core.set_property("CPU", {
 
 
 def load_openvino_model(model_dir):
-    """Load an OpenVINO model from a directory containing .xml and .bin files."""
+    """Load an OpenVINO model from a directory containing .xml and .bin files.
+
+    Dynamic-shape models are reshaped to a fixed static shape before compilation
+    so OpenVINO can fully optimize the graph once (avoids per-call recompilation).
+    """
     xml_files = [f for f in os.listdir(model_dir) if f.endswith(".xml")]
     if not xml_files:
         raise FileNotFoundError(f"No .xml file found in {model_dir}")
     model_file = os.path.join(model_dir, xml_files[0])
     model = _ov_core.read_model(model_file)
-    compiled_model = _ov_core.compile_model(model, "CPU")
-    output_layer = compiled_model.output(0)
-    partial_shape = compiled_model.input(0).get_partial_shape()
+    partial_shape = model.input(0).get_partial_shape()
     if partial_shape.is_static:
         input_shape = list(partial_shape.to_shape())
     else:
@@ -86,6 +88,12 @@ def load_openvino_model(model_dir):
         else:
             input_shape = [1, 3, 640, 640]
             logging.info(f"Dynamic shape model, no metadata found, using default 640x640")
+        # Reshape to fixed static shape BEFORE compilation — this lets OpenVINO
+        # compile an optimised graph once instead of re-planning on every call.
+        model.reshape({model.input(0): input_shape})
+        logging.info(f"Reshaped model to static input: {input_shape}")
+    compiled_model = _ov_core.compile_model(model, "CPU")
+    output_layer = compiled_model.output(0)
     logging.info(f"Loaded OpenVINO model: {model_file}, input shape: {input_shape}")
     return compiled_model, output_layer, input_shape
 
@@ -258,8 +266,8 @@ signal.signal(signal.SIGTERM, sigterm_handler)
 
 ###################################WARMUP FOR MODEL############################################
 logging.info("Warming up 2G model...")
-# Warmup with smaller blob (actual 2G images are much smaller than model max)
-dummy_blob = np.zeros((1, 3, 64, 640), dtype=np.float32)
+# Warmup must use the exact static shape the model was compiled with
+dummy_blob = np.zeros((1, 3, model_2g_h, model_2g_w), dtype=np.float32)
 model_2g_compiled([dummy_blob])[model_2g_output]
 
 logging.info("Warming up 3G/4G model...")
@@ -473,11 +481,11 @@ def predict_samples(center_freq_recv,bandwidth_recv,num_center_frequencies_recv,
         if save_samples == "YES":
             save_sample(colormapped_array, center_freq)
 
-        # 3G/4G inference via OpenVINO (dynamic shape model: auto=True for stride-aligned padding)
+        # 3G/4G inference via OpenVINO (fixed model shape — auto=False for consistent tensor size)
         detections_3g_4g = run_inference(model_3g_4g_compiled, model_3g_4g_output,
                                          colormapped_array, conf_threshold=0.6,
                                          target_h=model_3g_4g_h, target_w=model_3g_4g_w,
-                                         auto=True)
+                                         auto=False)
 
         img_width = colormapped_array.shape[1]
         xval_list = process_results_3g_4g(detections_3g_4g,xval_list,start_freq,bandwidth,img_width,
@@ -505,12 +513,11 @@ def predict_samples(center_freq_recv,bandwidth_recv,num_center_frequencies_recv,
 
         del colormapped_array
 
-        # 2G inference via OpenVINO (dynamic shape model: auto=True for stride-aligned padding)
+        # 2G inference via OpenVINO (fixed model shape — auto=False for consistent tensor size)
         detections_2g = run_inference(model_2g_compiled, model_2g_output,
                                       colormapped_array_2G, conf_threshold=0.3,
-                                      target_h=colormapped_array_2G.shape[0],
-                                      target_w=colormapped_array_2G.shape[1],
-                                      auto=True)
+                                      target_h=model_2g_h, target_w=model_2g_w,
+                                      auto=False)
 
         process_results_2g(detections_2g,start_freq_for_each_chunk,chunk_start_indexes_in_new_image,
                             predicted_freq_list_2g)
