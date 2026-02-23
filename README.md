@@ -1,4 +1,4 @@
-# Scanner AI v2 - OpenVINO Runtime
+# OpenVINO Runtime
 
 Spectrum channel detector for 2G/3G/4G cellular frequencies. Runs YOLO models exported to OpenVINO IR format with dynamic input shapes. No PyTorch or Ultralytics dependency at runtime.
 
