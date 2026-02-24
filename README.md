@@ -57,6 +57,7 @@ This version eliminates memory leaks that caused unbounded growth under continuo
 - Model files:
   - `2G_MODEL/best_int8_openvino_model/` (OpenVINO INT8 format)
   - `3G_4G_MODEL/best.pt` (PyTorch weights)
+- `dummy.jpg` - warmup image (included in repo). Used to warm up models at startup for faster first inference. If missing, warmup is skipped with a warning.
 
 ## Setup
 
@@ -71,6 +72,7 @@ cd Ultralytics
 
 ```
 Ultralytics/
+  dummy.jpg                      # Warmup image (included in repo)
   2G_MODEL/
     best_int8_openvino_model/    # OpenVINO INT8 model
       best.xml
@@ -91,7 +93,7 @@ docker run -p 4444:4444 \
   -e SAVE_SAMPLES=NO \
   -e MEM_OPTIMIZATION=YES \
   -e MAX_THREADS=2 \
-  --memory=4g \
+  --memory=3g \
   scanner-ai
 ```
 
@@ -153,6 +155,7 @@ TCP socket on port 4444 using length-prefixed protobuf messages:
 Ultralytics/
   scanner.py             # Main service: TCP server + Ultralytics YOLO inference
   ai_colormap.py         # Viridis colormap and power normalization
+  dummy.jpg              # Warmup image for model initialization
   viridis_colormap.py    # Colormap data
   ai_model_pb2.py        # Protobuf generated message definitions
   ai_model.proto         # Protobuf schema definition

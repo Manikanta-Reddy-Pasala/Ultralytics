@@ -1,6 +1,4 @@
 import numpy as np
-from numpy.lib.stride_tricks import as_strided
-from PIL import Image
 import viridis_colormap as viridis_map
 
 """
@@ -12,11 +10,11 @@ class CustomImg:
 
     # Init funtion colormap should be str HSV OR VIRIDIS
     def __init__(self):
-        self.colors = viridis_map.var
-    # Map colors
+        # Pre-convert colormap to uint8 (source is int64, values 0-254)
+        self.colors = np.array(viridis_map.var, dtype=np.uint8)
+    # Map colors - returns uint8 directly
     def map_colors(self,img) :
-        img = self.colors[img.astype(int)]
-        return img
+        return self.colors[img.astype(np.intp)]
      # Prepare custome image
     def get_new_img(self,img) :
         return self.map_colors(img)
@@ -30,7 +28,10 @@ class NormalizePowerValue:
         self.step_size = step_size
     def get_normalized_values(self,img):
         # for now lets make range from -120 to -20 dbm with .5 dbm step
-        img = np.clip(img,-130,-3)
-        img = np.round(img/self.step_size) * self.step_size
-        img = np.abs((img - (-130)) / self.step_size)
-        return img
+        # Use single output array to minimize memory copies
+        out = np.clip(img, -130, -3)
+        np.round(out / self.step_size, out=out)
+        out *= self.step_size
+        out += 130
+        out /= self.step_size
+        return out

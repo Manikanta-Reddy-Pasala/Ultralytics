@@ -55,13 +55,15 @@ model_2g_new = YOLO("2G_MODEL/best_int8_openvino_model/", task="detect")
 model_3g_4g_new = YOLO("3G_4G_MODEL/best.pt", task="detect")
 
 ###################################WARMUP FOR MODEL############################################
-with torch.no_grad():
-    logging.info("Warming up 2G model...")
-    model_2g_new.predict(dummy_file, imgsz=[32, 32])
-    logging.info("Warming up 3G/4G model...")
-    model_3g_4g_new.predict(dummy_file, imgsz=[32, 32])
-
-gc.collect()
+if os.path.exists(dummy_file):
+    with torch.no_grad():
+        logging.info("Warming up 2G model...")
+        model_2g_new.predict(dummy_file, imgsz=[32, 32])
+        logging.info("Warming up 3G/4G model...")
+        model_3g_4g_new.predict(dummy_file, imgsz=[32, 32])
+    gc.collect()
+else:
+    logging.warning(f"Warmup image '{dummy_file}' not found, skipping warmup. First inference will be slower.")
 
 ##################################CREATE SOCKET ##############################################
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -212,8 +214,8 @@ def predict_samples(center_freq_recv, bandwidth_recv, num_center_frequencies_rec
 
     tstart = datetime.now()
 
-    # Direct slice - no np.copy needed
-    spectrogram = data[:, 357:1691]
+    # data is already sliced to [:, 357:1691] by caller
+    spectrogram = data
     num_of_samples_in_freq = data.shape[0] // num_center_frequencies
 
     num_chunks = 1
@@ -234,14 +236,15 @@ def predict_samples(center_freq_recv, bandwidth_recv, num_center_frequencies_rec
 
         if memory_optimization == "YES" and num_chunks > 1:
             img = _normalizer.get_normalized_values(spectrogram_predict)
+            del spectrogram_predict
         else:
             img = _normalizer.get_normalized_values(spectrogram_new)
             center_freq = center_freq_orig
 
         colormapped_array = _color_mapper.get_new_img(img)
-        colormapped_array = colormapped_array.astype(np.uint8)
-        colormapped_array = colormapped_array[..., ::-1]
         del img
+        # colormap already returns uint8; just flip RGB->BGR for OpenCV/Ultralytics
+        colormapped_array = colormapped_array[..., ::-1]
 
         xval_list = []
         chunk_start_indexes_in_new_image = []
@@ -343,7 +346,7 @@ def recieve_samples(conn, initial_byte_size, scanner_ai_save_samples, memory_opt
             bytes_recd += nbytes
 
         scanner_ai_data_req_1 = ai_model_pb2.AIModelReq()
-        scanner_ai_data_req_1.ParseFromString(bytes(recv_buf))
+        scanner_ai_data_req_1.ParseFromString(recv_buf)
         del recv_buf, view
 
         if scanner_ai_data_req_1.WhichOneof("message") == "sample_data_req":
@@ -352,7 +355,11 @@ def recieve_samples(conn, initial_byte_size, scanner_ai_save_samples, memory_opt
             del scanner_ai_data_req_1
             length = len(sample)
             sample = sample.reshape(length // fft_size, fft_size)
-            predicted_4g, predicted_3g, predicted_2g, time_taken = predict_samples(center_freq, bandwidth, num_center_freq, overlap, sample, scanner_ai_save_samples, memory_optimization)
+            # Extract the spectrogram slice as a contiguous copy so `sample` can be freed
+            spectrogram_slice = np.array(sample[:, 357:1691])
+            del sample
+            predicted_4g, predicted_3g, predicted_2g, time_taken = predict_samples(center_freq, bandwidth, num_center_freq, overlap, spectrogram_slice, scanner_ai_save_samples, memory_optimization)
+            del spectrogram_slice
         else:
             logging.error("Wrong message type received expected sample_data_req")
             del scanner_ai_data_req_1

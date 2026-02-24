@@ -38,6 +38,3 @@ venv/
 
 # UV
 uv.lock
-
-# Dummy test images
-dummy.jpg
