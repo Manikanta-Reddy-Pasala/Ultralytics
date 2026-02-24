@@ -29,7 +29,7 @@ This version eliminates memory leaks that caused unbounded growth under continuo
 | Fix | Before | After |
 |-----|--------|-------|
 | Model reload | Deleted & reloaded 2G model every request | Load once at startup, reuse |
-| Input data handling | `np.copy(data)` duplicates entire array | Direct slicing `data[:, 357:1691]` |
+| Input data handling | `np.copy(data)` duplicates entire 2048-col array | Copy only needed slice `data[:, 357:1691]`, free original immediately |
 | Spectrogram assembly | `np.append()` in loop (O(n^2) alloc) | Collect parts, single `np.concatenate()` |
 | 2G image building | Repeated `np.concatenate()` in loop | Collect gap slices, single concat |
 | Colormap objects | Created per-request | Singleton, reused across requests |
