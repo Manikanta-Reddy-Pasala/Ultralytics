@@ -387,7 +387,7 @@ def recieve_samples(conn, initial_byte_size, scanner_ai_save_samples, memory_opt
         logging.info(f"Detected 2G frequencies by AI {predicted_2g}")
 
         logging.info(f"****************Total time taken by AI MODELS ****************************** {time_taken}")
-        del sample, predicted_4g, predicted_3g, predicted_2g
+        del predicted_4g, predicted_3g, predicted_2g
         gc.collect()
 
     finally:
