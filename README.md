@@ -114,16 +114,23 @@ The scanner starts a TCP server on port `4444` and waits for spectrogram data.
 
 ### Step 4: Run tests
 
-```bash
-# Start scanner in background
-MEM_OPTIMIZATION=YES python scanner.py &
-sleep 30  # wait for model warmup
+Tests run **outside** the container (or alongside a running scanner process) and connect to `127.0.0.1:4444`. They require `SAMPLES_UT/` directory with test data files.
 
-# Run tests
+```bash
+# Option A: Scanner running in Docker
+docker run -d -p 4444:4444 --memory=3g \
+  -e MEM_OPTIMIZATION=YES scanner-ai
+sleep 15  # wait for model warmup
+pip install pytest protobuf==3.20 numpy
+pytest testing/test_scanner_ai_script.py -v
+
+# Option B: Scanner running locally
+MEM_OPTIMIZATION=YES python scanner.py &
+sleep 15
 pytest testing/test_scanner_ai_script.py -v
 ```
 
-Test samples cover 6 bands: B1, B3, B8, B20, B28, B40.
+Test samples cover 6 bands: B1, B3, B8, B20, B28, B40. Test data files (`SAMPLES_UT/*.dat`) are not included in the repo due to size.
 
 ## Environment Variables
 
