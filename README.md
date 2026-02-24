@@ -1,6 +1,6 @@
-# Scanner AI v3 - OpenVINO Runtime
+# Scanner AI v3 - Ultralytics YOLO to OpenVINO
 
-Spectrum channel detector for 2G/3G/4G cellular frequencies. Runs YOLO models exported to OpenVINO IR format. No PyTorch or Ultralytics dependency at runtime.
+Spectrum channel detector for 2G/3G/4G cellular frequencies. Converts trained Ultralytics YOLO models (.pt) to OpenVINO IR format (FP32) and runs inference without PyTorch dependencies.
 
 ## Architecture
 
@@ -8,9 +8,9 @@ Spectrum channel detector for 2G/3G/4G cellular frequencies. Runs YOLO models ex
 Spectrogram (float32 FFT data)
   -> Normalize power values (-130 to -3 dBm)
   -> Apply Viridis colormap -> BGR uint8 image
-  -> 3G/4G detection (YOLOv12n, OpenVINO)
+  -> 3G/4G detection (YOLOv12n, dynamic shape, OpenVINO)
   -> Extract 2G regions (gaps between 3G/4G detections)
-  -> 2G detection (YOLO11n, OpenVINO)
+  -> 2G detection (YOLO11n, dynamic shape, OpenVINO)
   -> Convert pixel coordinates -> frequency (MHz)
   -> Return detected frequencies via protobuf over TCP
 ```
@@ -53,8 +53,8 @@ This version eliminates memory leaks that caused unbounded growth under continuo
 ### Step 1: Clone the repository
 
 ```bash
-git clone https://github.com/Manikanta-Reddy-Pasala/UltralyticsToOpenvino.git
-cd UltralyticsToOpenvino
+git clone https://github.com/Manikanta-Reddy-Pasala/Ultralytics.git
+cd Ultralytics
 ```
 
 ### Step 2: Place your trained model weights
@@ -62,7 +62,7 @@ cd UltralyticsToOpenvino
 Copy your `.pt` files into the model directories:
 
 ```
-UltralyticsToOpenvino/
+Ultralytics/
   2G_MODEL/
     best.pt
   3G_4G_MODEL/
@@ -177,7 +177,7 @@ TCP socket on port 4444 using length-prefixed protobuf messages:
 ## Project Structure
 
 ```
-UltralyticsToOpenvino/
+Ultralytics/
   scanner.py             # Main service: TCP server + OpenVINO inference pipeline
   ai_colormap.py         # Viridis colormap and power normalization
   viridis_colormap.py    # Colormap data
