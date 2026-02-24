@@ -1,8 +1,7 @@
 import os
 import logging
 import numpy as np
-import cv2
-import openvino as ov
+from ultralytics import YOLO
 import ai_colormap
 from datetime import datetime
 import socket
@@ -10,227 +9,38 @@ import ai_model_pb2
 from google.protobuf import message
 import threading
 from scanner_logging import setup_logging
+import torch
 import gc
 import signal
 import sys
+import cv2
 
 
 setup_logging()
 
 ###################PARAMETERS FROM THE HEADER##################################################
 sample_rate = 30.72e6
-center_freq = 938.9e6 #4G
+center_freq = 938.9e6  # 4G
 bandwidth = 58.6e6
 num_center_frequencies = 3
 overlap = 1
 fft_size = 2048
+dummy_file = "dummy.jpg"
 num_khz_per_fft_point = 15
-fifteen_mhz_points = int(15000/num_khz_per_fft_point)
-five_mhz_points = int(5000/num_khz_per_fft_point)
-
-################################ OpenVINO INFERENCE ENGINE #####################################
-
-# Single shared OpenVINO Core instance to avoid duplicate memory usage
-_ov_core = ov.Core()
-_ov_core.set_property("CPU", {
-    "INFERENCE_NUM_THREADS": "4",
-    "PERFORMANCE_HINT": "LATENCY",
-})
-
-def _read_model_imgsz(model_dir):
-    """Read imgsz from metadata.yaml in the model directory (simple parser, no PyYAML needed)."""
-    meta_path = os.path.join(model_dir, "metadata.yaml")
-    if not os.path.exists(meta_path):
-        return None
-    with open(meta_path, 'r') as f:
-        lines = f.readlines()
-    imgsz = []
-    in_imgsz = False
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("imgsz:"):
-            in_imgsz = True
-            continue
-        if in_imgsz:
-            if stripped.startswith("- "):
-                try:
-                    imgsz.append(int(stripped[2:]))
-                except ValueError:
-                    break
-            else:
-                break
-    if len(imgsz) == 2:
-        return imgsz
-    return None
-
-
-def load_openvino_model(model_dir):
-    """Load an OpenVINO model from a directory containing .xml and .bin files."""
-    xml_files = [f for f in os.listdir(model_dir) if f.endswith(".xml")]
-    if not xml_files:
-        raise FileNotFoundError(f"No .xml file found in {model_dir}")
-    model_file = os.path.join(model_dir, xml_files[0])
-    model = _ov_core.read_model(model_file)
-    compiled_model = _ov_core.compile_model(model, "CPU")
-    del model  # free the intermediate model representation
-    output_layer = compiled_model.output(0)
-    partial_shape = compiled_model.input(0).get_partial_shape()
-    if partial_shape.is_static:
-        input_shape = list(partial_shape.to_shape())
-    else:
-        meta_imgsz = _read_model_imgsz(model_dir)
-        if meta_imgsz:
-            input_shape = [1, 3, meta_imgsz[0], meta_imgsz[1]]
-            logging.info(f"Dynamic shape model, using imgsz from metadata: {meta_imgsz}")
-        else:
-            input_shape = [1, 3, 640, 640]
-            logging.info(f"Dynamic shape model, no metadata found, using default 640x640")
-    logging.info(f"Loaded OpenVINO model: {model_file}, input shape: {input_shape}")
-    return compiled_model, output_layer, input_shape
-
-
-def preprocess_image(img, target_h, target_w, auto=False, stride=32):
-    """Letterbox preprocess BGR uint8 image for YOLO OpenVINO inference."""
-    orig_h, orig_w = img.shape[:2]
-    scale = min(target_w / orig_w, target_h / orig_h)
-    new_w = int(round(orig_w * scale))
-    new_h = int(round(orig_h * scale))
-
-    if auto:
-        pad_w = (stride - new_w % stride) % stride
-        pad_h = (stride - new_h % stride) % stride
-        canvas_w = new_w + pad_w
-        canvas_h = new_h + pad_h
-        pad_left = pad_w // 2
-        pad_top = pad_h // 2
-    else:
-        canvas_w = target_w
-        canvas_h = target_h
-        pad_left = (target_w - new_w) // 2
-        pad_top = (target_h - new_h) // 2
-
-    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-    canvas = np.full((canvas_h, canvas_w, 3), 114, dtype=np.uint8)
-    canvas[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = resized
-    del resized  # free resized immediately
-
-    # Convert to float32 blob in-place as much as possible
-    blob = canvas.astype(np.float32)
-    del canvas
-    blob *= (1.0 / 255.0)
-    blob = blob.transpose(2, 0, 1)  # HWC -> CHW
-    blob = np.ascontiguousarray(blob)
-    blob = np.expand_dims(blob, 0)
-    letterbox_info = {'scale': scale, 'pad_w': pad_left, 'pad_h': pad_top,
-                      'orig_w': orig_w, 'orig_h': orig_h}
-    return blob, letterbox_info
-
-
-def numpy_nms(x1, y1, x2, y2, scores, iou_threshold):
-    """Non-Maximum Suppression (pure numpy)."""
-    areas = (x2 - x1) * (y2 - y1)
-    order = scores.argsort()[::-1]
-    keep = []
-    while len(order) > 0:
-        i = order[0]
-        keep.append(i)
-        if len(order) == 1:
-            break
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
-        w = np.maximum(0, xx2 - xx1)
-        h = np.maximum(0, yy2 - yy1)
-        intersection = w * h
-        iou = intersection / (areas[i] + areas[order[1:]] - intersection + 1e-6)
-        remaining = np.where(iou <= iou_threshold)[0]
-        order = order[remaining + 1]
-    return keep
-
-
-def postprocess_yolo_output(output, conf_threshold, letterbox_info, iou_threshold=0.45):
-    """Parse raw YOLO output tensor into detections."""
-    raw = output[0]  # (4+nc, N)
-    if raw.ndim != 2 or raw.shape[0] <= 4:
-        logging.warning(f"Unexpected model output shape {raw.shape}")
-        return []
-    predictions = raw.T  # (N, 4+nc)
-
-    class_scores = predictions[:, 4:]
-    max_scores = np.max(class_scores, axis=1)
-    mask = max_scores > conf_threshold
-    predictions = predictions[mask]
-    max_scores = max_scores[mask]
-
-    if len(predictions) == 0:
-        return []
-
-    class_ids = np.argmax(predictions[:, 4:], axis=1)
-    boxes = predictions[:, :4].copy()
-
-    scale = letterbox_info['scale']
-    pad_w = letterbox_info['pad_w']
-    pad_h = letterbox_info['pad_h']
-    boxes[:, 0] = (boxes[:, 0] - pad_w) / scale
-    boxes[:, 1] = (boxes[:, 1] - pad_h) / scale
-    boxes[:, 2] = boxes[:, 2] / scale
-    boxes[:, 3] = boxes[:, 3] / scale
-
-    x1 = boxes[:, 0] - boxes[:, 2] / 2
-    y1 = boxes[:, 1] - boxes[:, 3] / 2
-    x2 = boxes[:, 0] + boxes[:, 2] / 2
-    y2 = boxes[:, 1] + boxes[:, 3] / 2
-
-    num_classes = int(class_scores.shape[1]) if class_scores.ndim == 2 else 1
-    all_keep = []
-    for cls_id in range(num_classes):
-        cls_mask = class_ids == cls_id
-        if not np.any(cls_mask):
-            continue
-        cls_indices = np.where(cls_mask)[0]
-        cls_keep = numpy_nms(x1[cls_indices], y1[cls_indices],
-                             x2[cls_indices], y2[cls_indices],
-                             max_scores[cls_indices], iou_threshold)
-        all_keep.extend(cls_indices[k] for k in cls_keep)
-
-    detections = []
-    for i in all_keep:
-        detections.append({
-            'xywh': (float(boxes[i, 0]), float(boxes[i, 1]),
-                     float(boxes[i, 2]), float(boxes[i, 3])),
-            'cls': int(class_ids[i]),
-            'conf': float(max_scores[i]),
-        })
-
-    return detections
-
-
-def run_inference(compiled_model, output_layer, img, conf_threshold, target_h, target_w, iou_threshold=0.45, auto=False):
-    """Full inference pipeline: preprocess -> infer -> postprocess."""
-    blob, letterbox_info = preprocess_image(img, target_h, target_w, auto=auto)
-    raw_output = compiled_model([blob])[output_layer]
-    del blob  # free input tensor immediately after inference
-    detections = postprocess_yolo_output(raw_output, conf_threshold, letterbox_info, iou_threshold)
-    del raw_output  # free output tensor after postprocessing
-    logging.info(f"Inference: img {img.shape}, detections: {len(detections)}")
-    return detections
-
-
-################################AI MODEL IMPORT#################################################
-model_2g_compiled, model_2g_output, model_2g_shape = load_openvino_model("2G_MODEL/best_openvino_model/")
-model_3g_4g_compiled, model_3g_4g_output, model_3g_4g_shape = load_openvino_model("3G_4G_MODEL/best_openvino_model/")
-
-model_2g_h, model_2g_w = int(model_2g_shape[2]), int(model_2g_shape[3])
-model_3g_4g_h, model_3g_4g_w = int(model_3g_4g_shape[2]), int(model_3g_4g_shape[3])
+fifteen_mhz_points = int(15000 / num_khz_per_fft_point)
+five_mhz_points = int(5000 / num_khz_per_fft_point)
 
 edivide = 1e6
 emul = 1e3
 MAX_AI_BANDWIDTH = 60 * emul
 
-# Reusable colormap objects - avoid per-request allocation
+# Singleton colormap objects - reuse across all requests
 _normalizer = ai_colormap.NormalizePowerValue()
 _color_mapper = ai_colormap.CustomImg()
+
+# Thread concurrency limiter
+_max_concurrent_threads = int(os.getenv('MAX_THREADS', '2'))
+_thread_semaphore = threading.Semaphore(_max_concurrent_threads)
 
 
 def sigterm_handler(_signo, _stack_frame):
@@ -239,86 +49,87 @@ def sigterm_handler(_signo, _stack_frame):
 
 signal.signal(signal.SIGTERM, sigterm_handler)
 
-###################################WARMUP FOR MODEL############################################
-logging.info("Warming up 2G model...")
-dummy_blob = np.zeros((1, 3, model_2g_h, model_2g_w), dtype=np.float32)
-model_2g_compiled([dummy_blob])[model_2g_output]
 
-logging.info("Warming up 3G/4G model...")
-dummy_blob = np.zeros((1, 3, model_3g_4g_h, model_3g_4g_w), dtype=np.float32)
-model_3g_4g_compiled([dummy_blob])[model_3g_4g_output]
-del dummy_blob
+################################AI MODEL IMPORT#################################################
+model_2g_new = YOLO("2G_MODEL/best_int8_openvino_model/", task="detect")
+model_3g_4g_new = YOLO("3G_4G_MODEL/best.pt", task="detect")
+
+###################################WARMUP FOR MODEL############################################
+with torch.no_grad():
+    logging.info("Warming up 2G model...")
+    model_2g_new.predict(dummy_file, imgsz=[32, 32])
+    logging.info("Warming up 3G/4G model...")
+    model_3g_4g_new.predict(dummy_file, imgsz=[32, 32])
+
+gc.collect()
 
 ##################################CREATE SOCKET ##############################################
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
+
 def add_detected_cells_to_list(predicted_center_freq, clsitem, is_3g_4g, xval_list, xval, width,
-                               predicted_freq_list_2g, predicted_freq_list_3g, predicted_freq_list_4g):
+                               freq_list_2g, freq_list_3g, freq_list_4g):
     if is_3g_4g:
         if clsitem == 0:
-            xval_list.append([int(xval - width / 2), int(width)])
-            if predicted_center_freq not in predicted_freq_list_3g:
-                predicted_freq_list_3g.append(predicted_center_freq)
+            xval_list.append([int(xval.item() - width.item() / 2), int(width.item())])
+            if predicted_center_freq not in freq_list_3g:
+                freq_list_3g.append(predicted_center_freq)
         elif clsitem == 1 or clsitem == 2:
-            xval_list.append([int(xval - width / 2), int(width)])
-            if predicted_center_freq not in predicted_freq_list_4g:
-                predicted_freq_list_4g.append(predicted_center_freq)
+            xval_list.append([int(xval.item() - width.item() / 2), int(width.item())])
+            if predicted_center_freq not in freq_list_4g:
+                freq_list_4g.append(predicted_center_freq)
     else:
-        if predicted_center_freq not in predicted_freq_list_2g:
-            predicted_freq_list_2g.append(predicted_center_freq)
+        if predicted_center_freq not in freq_list_2g:
+            freq_list_2g.append(predicted_center_freq)
 
 
-def process_results_3g_4g(detections_3g_4g, xval_list, start_freq, bandwidth, img_width,
-                          predicted_freq_list_3g, predicted_freq_list_4g):
-    for det in detections_3g_4g:
-        clsitem = det['cls']
-        cx, cy, w, h = det['xywh']
-        xval = cx
-        width = w
-        pixel_size_of_img = img_width
-        predicted_center_freq = ((bandwidth/pixel_size_of_img) * xval)
-        predicted_center_freq += start_freq
-        predicted_center_freq /= edivide
-        predicted_center_freq = round(float(predicted_center_freq), 1)
-        add_detected_cells_to_list(predicted_center_freq,
-                clsitem,
-                True,
-                xval_list,
-                xval,
-                width,
-                None, predicted_freq_list_3g, predicted_freq_list_4g)
+def process_results_3g_4g(results_3g_4g, xval_list, start_freq, bandwidth,
+                          freq_list_3g, freq_list_4g):
+    for result in results_3g_4g:
+        if len(result.boxes) != 0:
+            pixel_size_of_img = result.orig_shape[1]
+            boxes = result.boxes
+            for idx, xywhn in enumerate(boxes.xywhn):
+                clsitem = int(boxes.cls[idx].item())
+                xval = boxes.xywh[idx][0]
+                width = boxes.xywh[idx][2]
+                predicted_center_freq = ((bandwidth / pixel_size_of_img) * xval)
+                predicted_center_freq += start_freq
+                predicted_center_freq /= edivide
+                predicted_center_freq = round(float(predicted_center_freq), 1)
+                add_detected_cells_to_list(predicted_center_freq,
+                        clsitem, True, xval_list, xval, width,
+                        None, freq_list_3g, freq_list_4g)
     xval_list.sort()
     return xval_list
 
 
-def process_results_2g(detections_2g, start_freq_for_each_chunk, chunk_start_indexes_in_new_image,
-                       predicted_freq_list_2g):
+def process_results_2g(results, start_freq_for_each_chunk, chunk_start_indexes_in_new_image, freq_list_2g):
     index_val = 0
-    for det in detections_2g:
-        clsitem = det['cls']
-        cx, cy, w, h = det['xywh']
-        x_val_in_image = cx
-        i = 0
-        while i < len(chunk_start_indexes_in_new_image):
-           if x_val_in_image < chunk_start_indexes_in_new_image[i]:
-               index_val = i - 1
-           else:
-               index_val = i
-           i = i + 1
+    for result in results:
+        if len(result.boxes) != 0:
+            boxes = result.boxes
+            for idx, xywhn in enumerate(boxes.xywhn):
+                clsitem = int(boxes.cls[idx].item())
+                xval = boxes.xywh[idx][0]
+                x_val_in_image = xval.item()
+                i = 0
+                while i < len(chunk_start_indexes_in_new_image):
+                    if x_val_in_image < chunk_start_indexes_in_new_image[i]:
+                        index_val = i - 1
+                    else:
+                        index_val = i
+                    i = i + 1
 
-        predicted_center_freq = (15000 * (x_val_in_image - chunk_start_indexes_in_new_image[index_val]))
-        start_freq_chunk_wise = start_freq_for_each_chunk[index_val]
+                predicted_center_freq = (15000 * (x_val_in_image - chunk_start_indexes_in_new_image[index_val]))
+                start_freq_chunk_wise = start_freq_for_each_chunk[index_val]
 
-        predicted_center_freq += start_freq_chunk_wise
-        predicted_center_freq /= edivide
-        predicted_center_freq = round(float(predicted_center_freq), 1)
-        add_detected_cells_to_list(predicted_center_freq,
-                clsitem,
-                False,
-                None,
-                0,
-                0,
-                predicted_freq_list_2g, None, None)
+                predicted_center_freq += start_freq_chunk_wise
+                predicted_center_freq /= edivide
+                predicted_center_freq = round(float(predicted_center_freq), 1)
+                add_detected_cells_to_list(predicted_center_freq,
+                        clsitem, False, None, 0, 0,
+                        freq_list_2g, None, None)
 
 
 def get_num_chunks_for_mem_optimization(bandwidth_recv, overlap):
@@ -330,24 +141,24 @@ def get_num_chunks_for_mem_optimization(bandwidth_recv, overlap):
 
 
 def create_correct_spectrogram_by_rearranging_samples(num_center_frequencies, spectrogram, num_of_samples_in_freq):
-    """Rearrange spectrogram chunks using single concatenation instead of repeated np.append."""
     if num_center_frequencies == 1:
         return spectrogram
 
-    # Collect all parts first, then concatenate once (instead of O(n) np.append calls)
     parts = []
     if num_center_frequencies == 2:
         parts.append(spectrogram[0:num_of_samples_in_freq - 1, :fifteen_mhz_points])
-        parts.append(spectrogram[num_of_samples_in_freq:2 * num_of_samples_in_freq - 1, five_mhz_points:])
+        parts.append(spectrogram[num_of_samples_in_freq:num_of_samples_in_freq * 2 - 1, five_mhz_points:])
     else:
-        # First chunk
-        parts.append(spectrogram[0:num_of_samples_in_freq - 1, :fifteen_mhz_points])
-        # Middle chunks
-        for lc in range(1, num_center_frequencies - 1):
-            parts.append(spectrogram[num_of_samples_in_freq * lc:num_of_samples_in_freq * (lc + 1) - 1, five_mhz_points:fifteen_mhz_points])
-        # Last chunk
-        lc = num_center_frequencies - 1
-        parts.append(spectrogram[num_of_samples_in_freq * lc:num_of_samples_in_freq * (lc + 1) - 1, five_mhz_points:])
+        loop_counter = 1
+        while loop_counter <= num_center_frequencies - 1:
+            if loop_counter == 1:
+                parts.append(spectrogram[0:num_of_samples_in_freq - 1, :fifteen_mhz_points])
+                parts.append(spectrogram[num_of_samples_in_freq:num_of_samples_in_freq * 2 - 1, five_mhz_points:fifteen_mhz_points])
+            elif loop_counter == num_center_frequencies - 1:
+                parts.append(spectrogram[num_of_samples_in_freq * loop_counter:num_of_samples_in_freq * (loop_counter + 1) - 1, five_mhz_points:])
+            else:
+                parts.append(spectrogram[num_of_samples_in_freq * loop_counter:num_of_samples_in_freq * (loop_counter + 1) - 1, five_mhz_points:fifteen_mhz_points])
+            loop_counter += 1
 
     spectrogram_new = np.concatenate(parts, axis=1)
     del parts
@@ -357,7 +168,6 @@ def create_correct_spectrogram_by_rearranging_samples(num_center_frequencies, sp
 def get_truncated_spectrum(spectrogram_new, num_chunks, chunk_iterator, center_freq_orig, num_samples_in_chunk, bandwidth, overlap):
 
     if num_chunks > 1:
-
         if chunk_iterator != 0:
             start_index = (chunk_iterator * num_samples_in_chunk) - (overlap * chunk_iterator)
             end_index = start_index + num_samples_in_chunk
@@ -370,10 +180,9 @@ def get_truncated_spectrum(spectrogram_new, num_chunks, chunk_iterator, center_f
                 end_index = spectrogram_new.shape[1]
                 spectrogram_predict = spectrogram_new[:, start_index:end_index]
                 bandwidth = (end_index - start_index) * num_khz_per_fft_point
-                center_freq = center_freq_orig + int(MAX_AI_BANDWIDTH/2) * emul + int(bandwidth/2) * emul - overlap * num_khz_per_fft_point * emul
+                center_freq = center_freq_orig + int(MAX_AI_BANDWIDTH / 2) * emul + int(bandwidth / 2) * emul - overlap * num_khz_per_fft_point * emul
                 bandwidth = bandwidth * emul
                 center_freq_orig = center_freq
-
         else:
             spectrogram_predict = spectrogram_new[:, 0:num_samples_in_chunk]
             center_freq = (center_freq_orig - int((bandwidth / 2))) + (int((MAX_AI_BANDWIDTH / 2)) * emul)
@@ -385,11 +194,13 @@ def get_truncated_spectrum(spectrogram_new, num_chunks, chunk_iterator, center_f
 
     return spectrogram_predict, center_freq, bandwidth, center_freq_orig
 
+
 def save_sample(colormapped_array, center_freq):
-    cv2.imwrite('SAMPLES_LOW_POWER/SCANNER_SAMPLES_CF_'+str(center_freq) + '_' + datetime.now().strftime("%Y_%m_%d_%H_%M_%S") + '.jpg', colormapped_array)
+    cv2.imwrite('SAMPLES_LOW_POWER/SCANNER_SAMPLES_CF_' + str(center_freq) + '_' + datetime.now().strftime("%Y_%m_%d_%H_%M_%S") + '.jpg', colormapped_array)
+
 
 def predict_samples(center_freq_recv, bandwidth_recv, num_center_frequencies_recv, overlap_recv, data, save_samples, memory_optimization):
-    # Use local lists instead of globals to avoid cross-request state leaks
+    # Local prediction lists - thread-safe, no globals
     predicted_freq_list_4g = []
     predicted_freq_list_3g = []
     predicted_freq_list_2g = []
@@ -401,16 +212,14 @@ def predict_samples(center_freq_recv, bandwidth_recv, num_center_frequencies_rec
 
     tstart = datetime.now()
 
-    # Work on data directly - avoid np.copy() which doubles memory
+    # Direct slice - no np.copy needed
+    spectrogram = data[:, 357:1691]
     num_of_samples_in_freq = data.shape[0] // num_center_frequencies
-
-    # Slice columns (views, no copy)
-    spectrogram = data[:, 357:1691]  # 357 to 357+1334
 
     num_chunks = 1
 
     spectrogram_new = create_correct_spectrogram_by_rearranging_samples(num_center_frequencies, spectrogram, num_of_samples_in_freq)
-    del spectrogram  # free the slice reference
+    del spectrogram
 
     if memory_optimization == "YES":
         num_chunks, overlap = get_num_chunks_for_mem_optimization(bandwidth_recv, overlap)
@@ -420,25 +229,19 @@ def predict_samples(center_freq_recv, bandwidth_recv, num_center_frequencies_rec
     for chunk_iterator in range(num_chunks):
 
         spectrogram_predict, center_freq, bandwidth, center_freq_orig = get_truncated_spectrum(spectrogram_new,
-                num_chunks,
-                chunk_iterator,
-                center_freq_orig,
-                num_samples_in_chunk,
-                bandwidth,
-                overlap)
+                num_chunks, chunk_iterator, center_freq_orig,
+                num_samples_in_chunk, bandwidth, overlap)
 
         if memory_optimization == "YES" and num_chunks > 1:
             img = _normalizer.get_normalized_values(spectrogram_predict)
-            del spectrogram_predict
         else:
             img = _normalizer.get_normalized_values(spectrogram_new)
             center_freq = center_freq_orig
 
         colormapped_array = _color_mapper.get_new_img(img)
-        del img  # free normalized array immediately
-
         colormapped_array = colormapped_array.astype(np.uint8)
         colormapped_array = colormapped_array[..., ::-1]
+        del img
 
         xval_list = []
         chunk_start_indexes_in_new_image = []
@@ -448,70 +251,49 @@ def predict_samples(center_freq_recv, bandwidth_recv, num_center_frequencies_rec
         if save_samples == "YES":
             save_sample(colormapped_array, center_freq)
 
-        # 3G/4G inference via OpenVINO
-        detections_3g_4g = run_inference(model_3g_4g_compiled, model_3g_4g_output,
-                                         colormapped_array, conf_threshold=0.6,
-                                         target_h=model_3g_4g_h, target_w=model_3g_4g_w)
+        # 3G/4G inference via Ultralytics (uses optimized C++ backend)
+        with torch.no_grad():
+            results_3g_4g = model_3g_4g_new(colormapped_array, conf=0.6, stream=True)
 
-        img_width = colormapped_array.shape[1]
-        xval_list = process_results_3g_4g(detections_3g_4g, xval_list, start_freq, bandwidth, img_width,
+        xval_list = process_results_3g_4g(results_3g_4g, xval_list, start_freq, bandwidth,
                                           predicted_freq_list_3g, predicted_freq_list_4g)
-        del detections_3g_4g
+        del results_3g_4g
 
-        # Build 2G image by extracting gaps between detected 3G/4G cells
-        # Use single concatenation instead of repeated growing
+        # Build 2G image from gaps between 3G/4G detections
+        gap_slices = []
+        for i in range(len(xval_list)):
+            if i == 0:
+                gap_slices.append(colormapped_array[:, 0:xval_list[i][0], :])
+                chunk_start_indexes_in_new_image.append(0)
+                start_freq_for_each_chunk.append(start_freq)
+            else:
+                start_freq_for_each_chunk.append(start_freq + (xval_list[i - 1][0] + xval_list[i - 1][1]) * 15000)
+                gap_slices.append(colormapped_array[:, xval_list[i - 1][0] + xval_list[i - 1][1]:xval_list[i][0], :])
+
         if len(xval_list) != 0:
-            gap_parts = []
-            gap_start_freqs = []
-            gap_pixel_starts = []
+            gap_slices.append(colormapped_array[:, xval_list[i][0] + xval_list[i][1]:, :])
+            start_freq_for_each_chunk.append(start_freq + (xval_list[i][0] + xval_list[i][1]) * 15000)
+            colormapped_array_2G = np.concatenate(gap_slices, axis=1)
+            chunk_start_indexes_in_new_image = []
             running_width = 0
-
-            # Gap before first detection
-            gap_parts.append(colormapped_array[:, 0:xval_list[0][0], :])
-            gap_pixel_starts.append(0)
-            gap_start_freqs.append(start_freq)
-            running_width += xval_list[0][0]
-
-            # Gaps between detections
-            for i in range(1, len(xval_list)):
-                gap_start = xval_list[i-1][0] + xval_list[i-1][1]
-                gap_end = xval_list[i][0]
-                gap_parts.append(colormapped_array[:, gap_start:gap_end, :])
-                gap_pixel_starts.append(running_width)
-                gap_start_freqs.append(start_freq + gap_start * 15000)
-                running_width += (gap_end - gap_start)
-
-            # Gap after last detection
-            last_idx = len(xval_list) - 1
-            last_det_end = xval_list[last_idx][0] + xval_list[last_idx][1]
-            gap_parts.append(colormapped_array[:, last_det_end:, :])
-            gap_pixel_starts.append(running_width)
-            gap_start_freqs.append(start_freq + last_det_end * 15000)
-
-            del colormapped_array  # free the full image
-
-            # Single concatenation instead of repeated np.concatenate in a loop
-            colormapped_array_2G = np.concatenate(gap_parts, axis=1)
-            del gap_parts
-
-            chunk_start_indexes_in_new_image = gap_pixel_starts
-            start_freq_for_each_chunk = gap_start_freqs
+            for sl in gap_slices:
+                chunk_start_indexes_in_new_image.append(running_width)
+                running_width += sl.shape[1]
         else:
             colormapped_array_2G = colormapped_array
-            del colormapped_array
             chunk_start_indexes_in_new_image.append(0)
             start_freq_for_each_chunk.append(start_freq)
 
-        # 2G inference via OpenVINO (use model's fixed 640x640 input size)
-        detections_2g = run_inference(model_2g_compiled, model_2g_output,
-                                      colormapped_array_2G, conf_threshold=0.3,
-                                      target_h=model_2g_h, target_w=model_2g_w)
+        del gap_slices, colormapped_array
 
-        del colormapped_array_2G  # free 2G image immediately after inference
+        # 2G inference via Ultralytics with actual image size (dynamic)
+        with torch.no_grad():
+            results_2g = model_2g_new(colormapped_array_2G, conf=0.3,
+                                      imgsz=[colormapped_array_2G.shape[0], colormapped_array_2G.shape[1]],
+                                      stream=True)
 
-        process_results_2g(detections_2g, start_freq_for_each_chunk, chunk_start_indexes_in_new_image,
-                          predicted_freq_list_2g)
-        del detections_2g
+        process_results_2g(results_2g, start_freq_for_each_chunk, chunk_start_indexes_in_new_image, predicted_freq_list_2g)
+        del results_2g, colormapped_array_2G
 
     tend = datetime.now()
     del spectrogram_new
@@ -537,10 +319,8 @@ def recieve_samples(conn, initial_byte_size, scanner_ai_save_samples, memory_opt
 
         payload = scanner_ai_res.SerializeToString()
         conn.send(payload)
-        del scanner_ai_res, payload
 
         if scanner_ai_data_req.WhichOneof("message") == "predict_sample_req":
-            sample_rate = scanner_ai_data_req.predict_sample_req.sampling_rate_khz
             center_freq = scanner_ai_data_req.predict_sample_req.center_freq_khz
             bandwidth = scanner_ai_data_req.predict_sample_req.bw_khz
             num_center_freq = scanner_ai_data_req.predict_sample_req.num_chunks
@@ -550,31 +330,29 @@ def recieve_samples(conn, initial_byte_size, scanner_ai_save_samples, memory_opt
             logging.error("Wrong message type received expected predict_sample_req")
             return
 
-        # Read sample data using a pre-allocated bytearray + recv_into
-        # instead of list of chunks + b''.join() which doubles memory
+        del scanner_ai_data_req
+
+        # Pre-allocated receive buffer - avoids chunks list memory overhead
         recv_buf = bytearray(sample_len)
         view = memoryview(recv_buf)
         bytes_recd = 0
-
         while bytes_recd < sample_len:
             nbytes = conn.recv_into(view[bytes_recd:], min(sample_len - bytes_recd, 65000))
             if nbytes == 0:
-                logging.error("Connection closed while receiving sample data")
-                return
+                raise RuntimeError("Socket connection broken")
             bytes_recd += nbytes
 
         scanner_ai_data_req_1 = ai_model_pb2.AIModelReq()
         scanner_ai_data_req_1.ParseFromString(bytes(recv_buf))
-        del recv_buf, view  # free receive buffer immediately
+        del recv_buf, view
 
         if scanner_ai_data_req_1.WhichOneof("message") == "sample_data_req":
             sample_data_req_id = scanner_ai_data_req_1.sample_data_req.id
             sample = np.array(scanner_ai_data_req_1.sample_data_req.samples, dtype=np.float32)
-            del scanner_ai_data_req_1  # free protobuf message holding all sample data
+            del scanner_ai_data_req_1
             length = len(sample)
             sample = sample.reshape(length // fft_size, fft_size)
             predicted_4g, predicted_3g, predicted_2g, time_taken = predict_samples(center_freq, bandwidth, num_center_freq, overlap, sample, scanner_ai_save_samples, memory_optimization)
-            del sample  # free sample array after prediction
         else:
             logging.error("Wrong message type received expected sample_data_req")
             del scanner_ai_data_req_1
@@ -588,15 +366,13 @@ def recieve_samples(conn, initial_byte_size, scanner_ai_save_samples, memory_opt
         scanner_ai_data_res.sample_data_res.umts_freqs[:] = predicted_3g[:]
         scanner_ai_data_res.sample_data_res.gsm_freqs[:] = predicted_2g[:]
         conn.send(scanner_ai_data_res.SerializeToString())
-        del scanner_ai_data_res
 
         logging.info("------------------HEADER CONTENTS-----------------")
-        logging.info(f"sample rate {scanner_ai_data_req.predict_sample_req.sampling_rate_khz}")
-        logging.info(f"center freq {scanner_ai_data_req.predict_sample_req.center_freq_khz}")
-        logging.info(f"bandwidth {scanner_ai_data_req.predict_sample_req.bw_khz}")
-        logging.info(f"chunks {scanner_ai_data_req.predict_sample_req.num_chunks}")
-        logging.info(f"overlap {scanner_ai_data_req.predict_sample_req.overlay_khz}")
-        logging.info(f"sample len {scanner_ai_data_req.predict_sample_req.samples_len}")
+        logging.info(f"center freq {center_freq}")
+        logging.info(f"bandwidth {bandwidth}")
+        logging.info(f"chunks {num_center_freq}")
+        logging.info(f"overlap {overlap}")
+        logging.info(f"sample len {sample_len}")
 
         logging.info("------------------AI MODEL PREDICTIONS-----------------")
         logging.info(f"Detected 4G frequencies by AI {predicted_4g}")
@@ -604,21 +380,14 @@ def recieve_samples(conn, initial_byte_size, scanner_ai_save_samples, memory_opt
         logging.info(f"Detected 2G frequencies by AI {predicted_2g}")
 
         logging.info(f"****************Total time taken by AI MODELS ****************************** {time_taken}")
-        del predicted_4g, predicted_3g, predicted_2g
+        del sample, predicted_4g, predicted_3g, predicted_2g
         gc.collect()
-    except Exception as e:
-        logging.error(f"Error processing request: {e}")
+
     finally:
         conn.close()
 
 
-# Thread pool semaphore to limit concurrent processing threads
-_max_concurrent_threads = int(os.getenv('MAX_THREADS', '2'))
-_thread_semaphore = threading.Semaphore(_max_concurrent_threads)
-
-
 def _worker_wrapper(conn, initial_byte_size, scanner_ai_save_samples, memory_optimization):
-    """Wrapper that acquires semaphore before processing, limits concurrent memory usage."""
     _thread_semaphore.acquire()
     try:
         recieve_samples(conn, initial_byte_size, scanner_ai_save_samples, memory_optimization)
@@ -632,13 +401,11 @@ def main():
     scanner_ai_save_samples = str(os.getenv('SAVE_SAMPLES'))
     memory_optimization = str(os.getenv('MEM_OPTIMIZATION'))
     logging.info(f"Starting Scanner AI service listening on port {scanner_ai_port} {scanner_ai_host}...")
-    logging.info(f"Max concurrent processing threads: {_max_concurrent_threads}")
     s.bind((scanner_ai_host, scanner_ai_port))
     s.listen(1)
     while True:
         connection, _ = s.accept()
         reciever_thread = threading.Thread(target=_worker_wrapper, args=(connection, 1024, scanner_ai_save_samples, memory_optimization))
-        reciever_thread.daemon = True
         reciever_thread.start()
 
 if __name__ == "__main__":

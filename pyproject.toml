@@ -1,16 +1,32 @@
 [project]
 name = "scanner-ai-v3"
 version = "3.0.0"
-description = "Spectrum channel detector - OpenVINO runtime (no PyTorch/Ultralytics)"
+description = "Spectrum channel detector"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = "==3.10.*"
 dependencies = [
     "numpy>=1.24.0",
     "Pillow",
-    "openvino>=2024.0.0",
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+    "ultralytics",
+    "openvino>=2024.0.0,!=2025.0.0",
     "opencv-python-headless>=4.8.0",
-    "protobuf>=4.21.0",
+    "protobuf==3.20",
 ]
 
 [project.optional-dependencies]
 test = ["coverage", "pytest"]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu" },
+]
+torchvision = [
+  { index = "pytorch-cpu" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
